@@ -8,6 +8,7 @@
 #include <Adafruit_SSD1306.h>
 #include "AudioTools.h"
 #include "AudioTools/AudioCodecs/CodecMP3Helix.h"
+#include "AudioTools/Communication/A2DPStream.h"
 #include "BluetoothA2DPSink.h"
 
 constexpr int I2S_BCK = 26, I2S_LRCK = 25, I2S_DATA = 27;
@@ -32,7 +33,12 @@ constexpr uint32_t VOLUME_SLIDE_MS = 180;
 constexpr uint32_t VOLUME_SHAKE_MS = 280;
 constexpr char BT_NAME[] = "ESP32_Music_Player";
 
-enum PlayerMode : uint8_t { MODE_SD = 0, MODE_BT = 1 };
+// MODE_BT receives phone audio; MODE_SD_BT sends SD audio to I2S and JBL earbuds.
+enum PlayerMode : uint8_t { 
+  MODE_SD = 0, 
+  MODE_BT = 1,
+  MODE_SD_BT = 2 
+};
 enum Screen : uint8_t { PLAYER, MENU, TRACK_LIST };
 
 PlayerMode mode = MODE_SD;
@@ -41,9 +47,18 @@ Preferences settings;
 bool settingsOK = false;
 Adafruit_SSD1306 oled(128, 64, &Wire, -1, 400000UL, 400000UL);
 bool oledOK = false, sdOK = false, audioOK = false;
+bool earbudsSourceStarted = false;
 I2SStream audioOutput;
-VolumeStream sdVolume(audioOutput);
+
+MultiOutput sdOutput;
+VolumeStream sdVolume(sdOutput);
+
 BluetoothA2DPSink bluetooth(audioOutput);
+A2DPStream bluetoothSource;
+
+// This must exactly match the Bluetooth name advertised by your earbuds.
+constexpr char JBL_TARGET_NAME[] = "Dhruv's JBL Wave Beam 2";
+
 audio_tools::MP3DecoderHelix *mp3 = nullptr;
 EncodedAudioStream *decoded = nullptr;
 StreamCopy copier(128); // Return to input/UI handling between small MP3 chunks.
@@ -284,14 +299,41 @@ void marquee(const String &text, int x, int y, int width, uint8_t size,
   if (x + width < 128) oled.fillRect(x + width, y, 128 - x - width, size * 8, background);
 }
 
-int menuCount() { return mode == MODE_SD ? 5 : 4; }
+int menuCount() { 
+  return mode == MODE_BT ? 5 : 6; 
+}
 
 String menuLabel(int index) {
   if (mode == MODE_SD) {
-    const char *labels[] = {"Browse songs", "Previous track", "Next track", "Use Bluetooth", "Back"};
+    const char *labels[] = {"Browse songs", 
+    "Previous track",
+    "Next track",
+    "Use Phone BT",
+    "SD + BT earbuds",
+    "Back"
+    };
     return labels[index];
   }
-  const char *labels[] = {"Previous track", "Next track", "Use SD card", "Back"};
+  if (mode == MODE_BT) {
+    const char *labels[] = {
+      "Previous track", 
+      "Next track", 
+      "Use SD card",
+      "SD + BT earbuds", 
+      "Back"
+    };
+    return labels[index];
+  }
+  
+  const char *labels[] = {
+    "Browse songs",
+    "Previous track",
+    "Next track",
+    "Use SD only",
+    "Use phone BT",
+    "Back"
+  };
+
   return labels[index];
 }
 
@@ -485,9 +527,30 @@ void drawList(bool songs) {
       const String label = songs ? songTitle(index) : menuLabel(index);
       if (index == selected) marquee(label, 17, y + 3, 94, 1, 1);
       else textAt(17, y + 3, label.substring(0, 15));
-      const int action = index - (mode == MODE_SD ? 1 : 0);
-      const int icon = songs || action < 0 ? 5 : action == 0 ? 3 : action == 1 ? 4 :
-                       action == 2 ? (mode == MODE_SD ? 1 : 0) : 6;
+      int icon = 5;
+
+      if (!songs) {
+        if (mode == MODE_BT || index != 0) {
+          const int offset = (mode == MODE_BT) ? 0 : 1;
+          const int action = index - offset;
+
+          if (action == 0) {
+            icon = 3;
+          }
+          else if (action == 1) {
+            icon = 4;
+          }
+          else if (action == 2) {
+            icon = (mode == MODE_SD) ? 1 : 0;
+          }
+          else if (action == 3) {
+            icon = 1;
+          }
+          else {
+            icon = 6;
+          }
+        }
+      }
       drawIcon(icon, 3, y + 2);
       if (songs && index == currentTrack) oled.fillCircle(115, y + 6, 1, SSD1306_WHITE);
     }
@@ -503,15 +566,33 @@ void drawList(bool songs) {
 }
 
 void drawPlayer() {
-  const bool connected = mode == MODE_BT && bluetooth.is_connected();
-  const bool playing = audioOK && (mode == MODE_SD ? songFile && !paused :
-                        connected && bluetooth.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED);
-  drawIcon(mode == MODE_SD ? 0 : 1, 1, 0);
-  textAt(14, 2, mode == MODE_SD ? "SD" : "BT");
+  const bool phoneConnected = mode == MODE_BT && bluetooth.is_connected();
+  const bool earbudsConnected = mode == MODE_SD_BT && earbudsSourceStarted &&
+                                bluetoothSource.source().is_connected();
+  const bool sdMode = (mode != MODE_BT);
+  const bool playing = audioOK && (sdMode ? (songFile && !paused) :
+                      (phoneConnected && bluetooth.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED));
+  drawIcon(mode == MODE_BT ? 1 : 0, 1, 0);
+
+  if (mode == MODE_SD) {
+    textAt(14, 2, "SD");
+  }
+  else if (mode == MODE_BT) {
+    textAt(14, 2, "BT");
+  }
+  else {
+      textAt(14, 2, "SD+BT");
+  }
+ 
   if (mode == MODE_BT) {
-    if (connected) oled.fillCircle(32, 5, 2, SSD1306_WHITE);
+    if (phoneConnected) oled.fillCircle(32, 5, 2, SSD1306_WHITE);
     else oled.drawCircle(32, 5, 2, SSD1306_WHITE);
   }
+  else if (mode == MODE_SD_BT) {
+    if (earbudsConnected) oled.fillCircle(48, 5, 2, SSD1306_WHITE);
+    else oled.drawCircle(48, 5, 2, SSD1306_WHITE);
+  }
+
   drawIcon(2, 57, 0);
   rightText(99, 2, String(volumePercent));
   if (!volumePercent) oled.drawLine(57, 0, 66, 9, SSD1306_WHITE);
@@ -521,14 +602,19 @@ void drawPlayer() {
   String title, detail;
   if (!audioOK) { title = "Audio error"; detail = "Check Serial Monitor"; }
   else if (mode == MODE_BT) {
-    title = connected ? (btTitle.length() ? btTitle : "Phone audio") : "Pair phone";
-    detail = connected ? (btArtist.length() ? btArtist : playing ? "Bluetooth streaming" : "Paused / ready") : BT_NAME;
+    title = phoneConnected ? (btTitle.length() ? btTitle : "Phone audio") : "Pair phone";
+    detail = phoneConnected ? (btArtist.length() ? btArtist : playing ? "Bluetooth streaming" : "Paused / ready") : BT_NAME;
   } else if (!sdOK || !trackCount) {
     title = sdOK ? "No songs" : "No SD card";
     detail = "FAT32 / MP3 in root";
   } else {
     title = songTitle(currentTrack);
-    detail = String(paused ? "PAUSED  " : "TRACK   ") + (currentTrack + 1) + " / " + trackCount;
+    if (mode == MODE_SD_BT) {
+      detail = earbudsConnected ? "JBL earbuds connected" : "Waiting for JBL earbuds";
+    }
+    else {
+      detail = String(paused ? "PAUSED  " : "TRACK   ") + (currentTrack + 1) + " / " + trackCount;
+    }
   }
   marquee(title, 2, 19, 124, 2, 0);
   textAt(2, 37, detail.substring(0, 21));
@@ -547,7 +633,7 @@ void drawPlayer() {
   } else oled.fillTriangle(62, 49, 62, 57, 68, 53, SSD1306_BLACK);
   // Pending click dots give feedback during the 300 ms multi-click window.
   for (uint8_t i = 0; i < button.clicks; ++i) oled.fillCircle(45 + i * 4, 53, 1, SSD1306_WHITE);
-  if (mode == MODE_SD && songFile && songFile.size()) {
+  if (mode != MODE_BT && songFile && songFile.size()) {
     const int progress = (uint64_t(songFile.position()) * 128) / songFile.size();
     oled.drawFastHLine(0, 63, progress, SSD1306_WHITE);
   }
@@ -767,12 +853,25 @@ void applyVolume() {
 
 // Reboot releases the previous Bluetooth/MP3 pipeline and its RAM completely.
 void switchMode(uint8_t target) {
-  if (target == mode) { setScreen(PLAYER); return; }
-  if (!settingsOK) { showNotice("Settings unavailable"); return; }
+  if (target == mode) { 
+    setScreen(PLAYER);
+    return; 
+  }
+
+  if (target > MODE_SD_BT) return;
+
+  if (!settingsOK) { 
+    showNotice("Settings unavailable"); 
+    return; 
+  }
   settings.putUChar("mode", target);
   settings.putUChar("volume", volumePercent);
-  if (mode == MODE_SD && currentTrack >= 0) settings.putString("song", tracks[currentTrack]);
-  showNotice(target == MODE_SD ? "Restart -> SD" : "Restart -> Bluetooth");
+
+  if (mode != MODE_BT && currentTrack >= 0) {
+    settings.putString("song", tracks[currentTrack]);
+  }
+  showNotice(target == MODE_SD ? "Restart -> SD" :
+             target == MODE_BT ? "Restart -> Phone BT" : "Restart -> SD + JBL");
   drawScreen();
   delay(250);
   ESP.restart();
@@ -780,29 +879,47 @@ void switchMode(uint8_t target) {
 
 void togglePlayback() {
   if (mode == MODE_BT && audioOK) {
-    if (!bluetooth.is_connected()) showNotice("Connect phone first");
-    else if (bluetooth.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED) bluetooth.pause();
-    else bluetooth.play();
-  } else if (songFile && currentTrack >= 0) {
+    if (!bluetooth.is_connected()) {
+      showNotice("Connect phone first");
+    }
+    else if (bluetooth.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED) {
+      bluetooth.pause();
+    }
+    else {
+      bluetooth.play();
+    }
+
+  } 
+  else if (songFile && currentTrack >= 0) {
     paused = !paused;
-  } else if (mode == MODE_SD && trackCount) {
+  } 
+  else if (mode != MODE_BT && trackCount) {
     startTrack(selectedTrack);
   }
+
   displayDirty = true;
 }
 
 void changeTrack(int movement) {
+
   if (!movement || !audioOK) return;
+
   transportAction = movement > 0 ? 1 : -1;
   transportUntil = millis() + 350;
-  if (mode == MODE_SD) {
-    if (!trackCount) { showNotice("No songs on SD"); return; }
+
+  if (mode != MODE_BT) {
+    if (!trackCount) { 
+      showNotice("No songs on SD"); 
+      return; 
+    }
     startTrack(((currentTrack + movement) % trackCount + trackCount) % trackCount);
-  } else if (bluetooth.is_connected()) {
+  } 
+  else if (bluetooth.is_connected()) {
     if (movement > 0) bluetooth.next();
     else bluetooth.previous();
 
-  } else {
+  } 
+  else {
     showNotice("Connect phone first");
   }
   displayDirty = true;
@@ -810,20 +927,37 @@ void changeTrack(int movement) {
 
 void shortPress() {
   if (screen == MENU) {
-    if (mode == MODE_SD && menuIndex == 0) {
+    if (mode != MODE_BT && menuIndex == 0) {
       selectedTrack = currentTrack >= 0 ? currentTrack : 0;
       setScreen(TRACK_LIST);
-    } else {
-      const int action = menuIndex - (mode == MODE_SD ? 1 : 0);
-      if (action == 0 || action == 1) {
-        changeTrack(action == 0 ? -1 : 1);
+    } 
+    else {
+      const int offset = (mode == MODE_BT) ? 0 : 1;
+      const int action = menuIndex - offset;
+      if (action == 0) {
+        changeTrack(-1);
         setScreen(PLAYER);
-      } else if (action == 2) switchMode(mode == MODE_SD ? MODE_BT : MODE_SD);
-      else setScreen(PLAYER);
+      }
+      else if (action == 1) {
+        changeTrack(1);
+        setScreen(PLAYER);
+      } 
+      else if (action == 2) {
+        switchMode(mode == MODE_SD ? MODE_BT : MODE_SD);
+      }
+      else if (action == 3) {
+        if (mode == MODE_SD_BT) switchMode(MODE_BT);
+        else switchMode(MODE_SD_BT);
+      }
+      else {
+        setScreen(PLAYER);
+      }
     }
-  } else if (screen == TRACK_LIST) {
+  } 
+  else if (screen == TRACK_LIST) {
     if (startTrack(selectedTrack)) setScreen(PLAYER);
-  } else {
+  } 
+  else {
     togglePlayback();
   }
   volumeHighlightUntil = 0;
@@ -907,13 +1041,15 @@ void handleSerial() {
     const char key = Serial.read();
     if (key == 'b') switchMode(MODE_BT);
     else if (key == 's') switchMode(MODE_SD);
+    else if (key == 'e') switchMode(MODE_SD_BT);
     else if (key == 'p') togglePlayback();
     else if (key == 'n') changeTrack(1);
     else if (key == 'v') changeTrack(-1);
     else if (key == 't') printBatteryStatus();
     else if (key == 'l') {
+      const char *modeName = mode == MODE_SD ? "SD" : mode == MODE_BT ? "Phone Bluetooth" : "SD + JBL Bluetooth";
       Serial.printf("Mode: %s | volume: %d%% | SD tracks: %d\n",
-                    mode == MODE_SD ? "SD" : "Bluetooth", volumePercent, trackCount);
+                    modeName, volumePercent, trackCount);
       for (int i = 0; i < trackCount; ++i) Serial.println(tracks[i]);
     }
   }
@@ -923,11 +1059,20 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println("\nESP32 SD / Bluetooth player");
-  Serial.println("Serial: s=SD, b=Bluetooth, p=play/pause, n=next, v=previous, l=list, t=battery");
+  Serial.println("Serial: s=SD, b=Bluetooth, e=SD + JBL earbuds, p=play/pause, n=next, v=previous, l=list, t=battery");
   Serial.println("Encoder: turn=volume, 1/2/3 clicks=play-pause/next/previous, hold=menu");
   settingsOK = settings.begin("music-player", false);
   if (settingsOK) {
-    mode = settings.getUChar("mode", MODE_SD) == MODE_BT ? MODE_BT : MODE_SD;
+    const uint8_t savedMode = settings.getUChar("mode", MODE_SD);
+
+    if (savedMode <= MODE_SD_BT) {
+      mode = static_cast<PlayerMode>(savedMode);
+    }
+
+    else {
+      mode = MODE_SD;
+    }
+
     volumePercent = constrain(int(settings.getUChar("volume", 35)), 0, 100);
   }
   pinMode(ENC_CLK, INPUT_PULLUP);
@@ -965,13 +1110,44 @@ void setup() {
     Serial.print("Bluetooth name: ");
     Serial.println(BT_NAME);
   } else {
+    
+    sdOutput.clear();
+    sdOutput.add(audioOutput);
+
+    if (mode == MODE_SD_BT) {
+
+      auto btConfig = bluetoothSource.defaultConfig(TX_MODE);
+
+      btConfig.name = JBL_TARGET_NAME;
+
+      btConfig.wait_for_connection = false;
+
+      btConfig.auto_reconnect = true;
+      btConfig.tx_write_timeout_ms = 20;
+
+      if (bluetoothSource.begin(btConfig)) {
+        earbudsSourceStarted = true;
+        sdOutput.add(bluetoothSource);
+        Serial.println("Bluetooth source started");
+        Serial.print("Target earbuds: ");
+        Serial.println(JBL_TARGET_NAME);
+      }
+      else {
+        Serial.println("Bluetooth source failed; wired output remains active");
+        showNotice("JBL Bluetooth failed");
+      }
+    }
+
+
     auto volumeConfig = sdVolume.defaultConfig();
     volumeConfig.sample_rate = 44100;
     volumeConfig.volume = volumePercent / 100.0f;
     sdVolume.begin(volumeConfig);
+
     mp3 = new audio_tools::MP3DecoderHelix();
     decoded = new EncodedAudioStream(&sdVolume, mp3);
-    // The codec wrapper forwards format changes through VolumeStream to I2S.
+
+    // MP3 PCM is sent through VolumeStream to every active output.
     scanSD();
     if (trackCount) {
       int resume = 0;
@@ -989,7 +1165,7 @@ void loop() {
   handleSerial();
   updateMetadata();
   updateBattery();
-  if (audioOK && mode == MODE_SD && songFile && !paused) {
+  if (audioOK && mode != MODE_BT && songFile && !paused) {
     copier.copy();
     if (!songFile.available()) {
       const int next = (currentTrack + 1) % trackCount;
